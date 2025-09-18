@@ -1,416 +1,564 @@
-'use client';
-import { useEffect, useMemo, useState } from 'react';
-import { createClient } from '@supabase/supabase-js';
+"use client";
+import React, { useEffect, useMemo, useState } from "react";
+import { createClient } from "@supabase/supabase-js";
+import { Auth } from "@supabase/auth-ui-react";
+import { ThemeSupa } from "@supabase/auth-ui-shared";
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL as string;
-const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY as string;
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// ------------------------------------------------------------
+// OIL INVENTORY — Next.js App Router (app/page.tsx)
+// Versione multi‑utente con Supabase Auth + persistenza su DB
+// Istruzioni veloci (una volta):
+// 1) npm i @supabase/supabase-js @supabase/auth-ui-react @supabase/auth-ui-shared
+// 2) In Vercel/Local aggiungi ENV:
+//    NEXT_PUBLIC_SUPABASE_URL=...
+//    NEXT_PUBLIC_SUPABASE_ANON_KEY=...
+// 3) In Supabase esegui lo schema (vedi in fondo a questo file, sezione SQL)
+// 4) Deploy: Vercel userà le ENV Production per la versione online.
+// ------------------------------------------------------------
 
-type Warehouse = { id: string; name: string };
-type StockRow = { warehouse: string; year: number; lot: 'A'|'B'|'C'; format: '500ml'|'250ml'|'5L'; pezzi: number; litri: number; };
-type HistoryRow = {
-  id: number;
-  created_at: string;
-  date: string;
-  warehouse: string;
-  operator: string | null;
-  type: 'ingresso' | 'uscita';
-  year: number;
-  lot: 'A'|'B'|'C';
-  format: '500ml'|'250ml'|'5L';
-  pieces: number;
-  liters: number;
-  notes: string | null;
+// ---- Types --------------------------------------------------
+
+type Warehouse = {
+  id: string; // slug-like key
+  name: string; // human label
 };
 
-function classNames(...classes: (string | false | null | undefined)[]) {
-  return classes.filter(Boolean).join(' ');
+type Format = "500ml" | "250ml" | "5L";
+
+type Lot = "A" | "B" | "C";
+
+interface ItemKey {
+  year: number;
+  lot: Lot;
+  format: Format;
+  warehouseId: string;
 }
 
-export default function InventoryApp() {
-  const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
-  const [stock, setStock] = useState<StockRow[]>([]);
-  const [history, setHistory] = useState<HistoryRow[]>([]);
+// ---- Supabase Client ----------------------------------------
+
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+// ---- Constants ----------------------------------------------
+
+const DEFAULT_WAREHOUSES: Warehouse[] = [
+  { id: "roma", name: "Roma" },
+  { id: "neci", name: "Neci" },
+];
+
+const LOTS: Lot[] = ["A", "B", "C"];
+const FORMATS: Format[] = ["500ml", "250ml", "5L"];
+
+// ---- Helpers -------------------------------------------------
+
+function keyOf(k: ItemKey) {
+  return `${k.year}_${k.lot}_${k.format}_${k.warehouseId}`;
+}
+
+function parseKey(s: string): ItemKey | null {
+  const [yearStr, lot, format, warehouseId] = s.split("_");
+  const year = Number(yearStr);
+  if (!year || !lot || !format || !warehouseId) return null;
+  return { year, lot: lot as Lot, format: format as Format, warehouseId };
+}
+
+function csvEscape(v: string | number) {
+  const s = String(v);
+  return /[",
+]/.test(s) ? '"' + s.replaceAll('"', '""') + '"' : s;
+}
+
+// ---- Main Component -----------------------------------------
+
+export default function OilInventoryPage() {
+  const [warehouses, setWarehouses] = useState<Warehouse[]>(DEFAULT_WAREHOUSES);
+  const [years, setYears] = useState<number[]>([new Date().getFullYear()]);
+  const [quantities, setQuantities] = useState<Record<string, number>>({});
+  const [filterYear, setFilterYear] = useState<number | "all">("all");
+  const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string|null>(null);
-  const [success, setSuccess] = useState<string|null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
 
-  // Filters
-  const [fWarehouse, setFWarehouse] = useState<string>('Tutti');
-  const [fYear, setFYear] = useState<string>('Tutti');
-  const [fLot, setFLot] = useState<string>('Tutti');
-  const [fFormat, setFFormat] = useState<string>('Tutti');
-  const [search, setSearch] = useState<string>('');
-
-  const today = useMemo(() => new Date().toISOString().split('T')[0], []);
-
-  // Form state
-  const [form, setForm] = useState({
-    date: today, operator: '', warehouse_id: '',
-    type: 'Ingresso' as 'Ingresso'|'Uscita',
-    year: new Date().getFullYear(),
-    lot: 'A' as 'A'|'B'|'C',
-    format: '500ml' as '500ml'|'250ml'|'5L',
-    pieces: 1, notes: ''
-  });
-
-  const volumeMl = (fmt: string) => (fmt === '500ml' ? 500 : fmt === '250ml' ? 250 : 5000);
-  const litersPreview = useMemo(() => (form.pieces * volumeMl(form.format)) / 1000, [form.pieces, form.format]);
-
-  // Load data
+  // ---- Auth state -------------------------------------------
   useEffect(() => {
+    let subscribed = true;
     (async () => {
-      try {
-        const [{ data: w, error: wErr }, { data: s, error: sErr }, { data: h, error: hErr }] = await Promise.all([
-          supabase.from('warehouses').select('*').order('name', { ascending: true }),
-          supabase.from('v_stock').select('*'),
-          supabase.from('v_history').select('*').limit(200)
-        ]);
-        if (wErr) throw wErr; if (sErr) throw sErr; if (hErr) throw hErr;
-        setWarehouses(w || []);
-        setStock((s || []) as StockRow[]);
-        setHistory((h || []) as HistoryRow[]);
-        if ((w || []).length && !form.warehouse_id) setForm(f => ({ ...f, warehouse_id: (w as Warehouse[])[0].id }));
-      } catch (e:any) {
-        setError(e.message || 'Errore di caricamento');
-      } finally {
-        setLoading(false);
-      }
+      const { data } = await supabase.auth.getUser();
+      if (!subscribed) return;
+      setUserId(data.user?.id ?? null);
+      setLoading(false);
     })();
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUserId(session?.user?.id ?? null);
+    });
+    return () => {
+      subscribed = false;
+      sub.subscription.unsubscribe();
+    };
   }, []);
 
-  async function refreshData() {
-    const [{ data: s }, { data: h }] = await Promise.all([
-      supabase.from('v_stock').select('*'),
-      supabase.from('v_history').select('*').limit(200)
-    ]);
-    setStock((s || []) as StockRow[]);
-    setHistory((h || []) as HistoryRow[]);
-  }
+  // ---- Load data from Supabase once the user is logged in ----
+  useEffect(() => {
+    if (!userId) return;
+    (async () => {
+      setLoading(true);
+      const { data, error } = await supabase
+        .from("inventory")
+        .select("year, lot, format, warehouse_id, qty")
+        .order("year", { ascending: false });
+      if (error) {
+        console.error(error);
+        setLoading(false);
+        return;
+      }
+      const next: Record<string, number> = {};
+      const nextYears = new Set<number>();
+      for (const row of data) {
+        const { year, lot, format, warehouse_id, qty } = row as any;
+        next[keyOf({ year, lot, format, warehouseId: warehouse_id })] = qty;
+        nextYears.add(year);
+      }
+      setQuantities(next);
+      if (nextYears.size > 0) setYears(Array.from(nextYears).sort((a, b) => b - a));
+      setLoading(false);
+    })();
+  }, [userId]);
 
-  async function seedWarehouses() {
-    const { error } = await supabase.from('warehouses').insert([{ name: 'Roma' }, { name: 'Neci' }]);
-    if (!error) {
-      const { data } = await supabase.from('warehouses').select('*').order('name');
-      setWarehouses(data || []);
+  const rows = useMemo(() => {
+    const makeRows: Array<{
+      year: number;
+      lot: Lot;
+      format: Format;
+      totals: Record<string, number>;
+    }> = [];
+
+    for (const year of years.sort((a, b) => b - a)) {
+      for (const lot of LOTS) {
+        for (const format of FORMATS) {
+          const totals: Record<string, number> = {};
+          for (const w of warehouses) {
+            const q = quantities[keyOf({ year, lot, format, warehouseId: w.id })] || 0;
+            totals[w.id] = q;
+          }
+          makeRows.push({ year, lot, format, totals });
+        }
+      }
     }
-  }
 
-  async function submitMovement() {
-    setSubmitting(true); setError(null); setSuccess(null);
-    try {
-      if (!form.warehouse_id) throw new Error('Seleziona un magazzino');
-      if (form.pieces <= 0) throw new Error('Pezzi deve essere > 0');
-      const payload = {
-        date: form.date, operator: form.operator || null, warehouse_id: form.warehouse_id,
-        type: form.type === 'Ingresso' ? 'ingresso' : 'uscita',
-        year: form.year, lot: form.lot, format: form.format, pieces: form.pieces, notes: form.notes || null
-      };
-      const { error } = await supabase.from('movements').insert(payload);
-      if (error) throw error;
-      setForm(f => ({ ...f, pieces: 1, notes: '' }));
-      await refreshData();
-      setSuccess('Movimento registrato!');
-      setTimeout(() => setSuccess(null), 2000);
-    } catch (e:any) {
-      setError(e.message || 'Errore di salvataggio');
-    } finally {
-      setSubmitting(false);
+    let filtered = makeRows;
+    if (filterYear !== "all") filtered = filtered.filter((r) => r.year === filterYear);
+
+    if (search.trim()) {
+      const s = search.trim().toLowerCase();
+      filtered = filtered.filter(
+        (r) =>
+          String(r.year).includes(s) ||
+          r.lot.toLowerCase().includes(s) ||
+          r.format.toLowerCase().includes(s)
+      );
     }
+
+    return filtered;
+  }, [years, warehouses, quantities, filterYear, search]);
+
+  const grandTotals = useMemo(() => {
+    const byWarehouse: Record<string, number> = {};
+    for (const w of warehouses) byWarehouse[w.id] = 0;
+    for (const k in quantities) {
+      const parsed = parseKey(k);
+      if (!parsed) continue;
+      if (filterYear !== "all" && parsed.year !== filterYear) continue;
+      byWarehouse[parsed.warehouseId] += quantities[k] || 0;
+    }
+    return byWarehouse;
+  }, [quantities, warehouses, filterYear]);
+
+  async function persistQty(k: ItemKey, qty: number) {
+    // upsert su Supabase
+    const { error } = await supabase.from("inventory").upsert({
+      year: k.year,
+      lot: k.lot,
+      format: k.format,
+      warehouse_id: k.warehouseId,
+      qty,
+    });
+    if (error) console.error("Errore upsert:", error);
   }
 
-  const filteredStock = useMemo(() => {
-    return stock.filter(r =>
-      (fWarehouse === 'Tutti' || r.warehouse === fWarehouse) &&
-      (fYear === 'Tutti' || String(r.year) === fYear) &&
-      (fLot === 'Tutti' || r.lot === fLot) &&
-      (fFormat === 'Tutti' || r.format === fFormat)
-    );
-  }, [stock, fWarehouse, fYear, fLot, fFormat]);
+  function setQty(k: ItemKey, next: number) {
+    const q = Math.max(0, Math.floor(next));
+    setQuantities((prev) => {
+      const updated = { ...prev, [keyOf(k)]: q };
+      return updated;
+    });
+    persistQty(k, q);
+  }
 
-  const filteredHistory = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return history.filter(h =>
-      (fWarehouse === 'Tutti' || h.warehouse === fWarehouse) &&
-      (fYear === 'Tutti' || String(h.year) === fYear) &&
-      (fLot === 'Tutti' || h.lot === fLot) &&
-      (fFormat === 'Tutti' || h.format === fFormat) &&
-      (!q || (h.notes || '').toLowerCase().includes(q) || (h.operator || '').toLowerCase().includes(q))
-    );
-  }, [history, fWarehouse, fYear, fLot, fFormat, search]);
+  function adjust(k: ItemKey, delta: number) {
+    const curr = quantities[keyOf(k)] || 0;
+    setQty(k, curr + delta);
+  }
 
-  const years = useMemo(() => {
-    const set = new Set<string>(stock.map(s => String(s.year)));
-    const arr = Array.from(set).sort((a,b)=> Number(b)-Number(a));
-    return ['Tutti', ...(arr.length ? arr : [String(new Date().getFullYear())])];
-  }, [stock]);
+  function addYear() {
+    const y = prompt("Aggiungi anno (es. 2025)");
+    if (!y) return;
+    const n = Number(y);
+    if (!n || n < 2000 || n > 2100) return alert("Anno non valido");
+    setYears((prev) => Array.from(new Set([...prev, n])).sort((a, b) => b - a));
+  }
 
-  const lots = ['Tutti','A','B','C'];
-  const formats = ['Tutti','500ml','250ml','5L'];
-  const warehouseOptions = ['Tutti', ...warehouses.map(w => w.name)];
+  function addWarehouse() {
+    const name = prompt("Nome magazzino");
+    if (!name) return;
+    const id = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-");
+    if (!id) return alert("Nome non valido");
+    if (warehouses.find((w) => w.id === id)) return alert("Magazzino già presente");
+    setWarehouses((prev) => [...prev, { id, name: name.trim() }]);
+  }
 
-  const kpi = useMemo(() => {
-    const pezzi = filteredStock.reduce((sum, r) => sum + (r.pezzi || 0), 0);
-    const litri = filteredStock.reduce((sum, r) => sum + (r.litri || 0), 0);
-    const last = history[0]?.created_at ? new Date(history[0].created_at) : null;
-    return { pezzi, litri, last };
-  }, [filteredStock, history]);
+  function renameWarehouse(id: string) {
+    const w = warehouses.find((w) => w.id === id);
+    if (!w) return;
+    const name = prompt("Rinomina magazzino", w.name);
+    if (!name) return;
+    setWarehouses((prev) => prev.map((x) => (x.id === id ? { ...x, name } : x)));
+  }
 
-  function downloadCSV(name: string, rows: any[]) {
-    const headers = Object.keys(rows[0] || {});
-    const csv = [headers.join(','), ...rows.map(r => headers.map(h => {
-      const val = (r as any)[h];
-      const s = val == null ? '' : String(val).replace(/"/g,'""');
-      return `"${s}"`;
-    }).join(','))].join('\\n'); // <-- FIXED: single-line join with newline
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  function deleteWarehouse(id: string) {
+    if (!confirm("Eliminare questo magazzino? I dati resteranno nel DB ma non saranno mostrati.")) return;
+    setWarehouses((prev) => prev.filter((w) => w.id !== id));
+  }
+
+  function exportCSV() {
+    const headers = ["year", "lot", "format", "warehouse", "qty"];
+    const lines = [headers.join(",")];
+    for (const k in quantities) {
+      const p = parseKey(k);
+      if (!p) continue;
+      lines.push(
+        [p.year, p.lot, p.format, p.warehouseId, quantities[k]].map(csvEscape).join(",")
+      );
+    }
+    const blob = new Blob([lines.join("
+")], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `${name}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "oil-inventory.csv";
+    a.click();
     URL.revokeObjectURL(url);
   }
 
+  function importCSV(ev: React.ChangeEvent<HTMLInputElement>) {
+    const file = ev.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const text = String(reader.result || "");
+        const lines = text.split(/
+?
+/).filter(Boolean);
+        const [header, ...rows] = lines;
+        const cols = header.split(",").map((s) => s.trim());
+        const colIdx = (name: string) => cols.findIndex((c) => c === name);
+        const iYear = colIdx("year");
+        const iLot = colIdx("lot");
+        const iFormat = colIdx("format");
+        const iWh = colIdx("warehouse");
+        const iQty = colIdx("qty");
+        if ([iYear, iLot, iFormat, iWh, iQty].some((i) => i < 0))
+          throw new Error("Colonne richieste: year, lot, format, warehouse, qty");
+        const ups: any[] = [];
+        const next: Record<string, number> = { ...quantities };
+        const nextYears = new Set(years);
+        for (const r of rows) {
+          const cells = r.split(",");
+          const year = Number(cells[iYear]);
+          const lot = cells[iLot] as Lot;
+          const format = cells[iFormat] as Format;
+          const warehouseId = cells[iWh];
+          const qty = Number(cells[iQty]);
+          if (!year || !lot || !format || !warehouseId || isNaN(qty)) continue;
+          next[keyOf({ year, lot, format, warehouseId })] = Math.max(0, Math.floor(qty));
+          nextYears.add(year);
+          ups.push({ year, lot, format, warehouse_id: warehouseId, qty: Math.max(0, Math.floor(qty)) });
+        }
+        setQuantities(next);
+        setYears(Array.from(nextYears).sort((a, b) => b - a));
+        // Batch upsert
+        if (ups.length) {
+          const { error } = await supabase.from("inventory").upsert(ups, { onConflict: "year,lot,format,warehouse_id" });
+          if (error) throw error;
+        }
+        alert("Importazione completata");
+      } catch (e: any) {
+        alert("Errore importazione: " + e.message);
+      } finally {
+        ev.target.value = ""; // reset file input
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  // ---- UI ----------------------------------------------------
+
   if (loading) {
     return (
-      <div className="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100 p-6">
-        <div className="max-w-7xl mx-auto">
-          <div className="h-10 w-64 bg-slate-200 rounded-xl animate-pulse mb-6" />
-          <div className="grid md:grid-cols-2 gap-6">
-            <div className="h-96 bg-white rounded-2xl shadow-sm ring-1 ring-slate-200 animate-pulse" />
-            <div className="h-96 bg-white rounded-2xl shadow-sm ring-1 ring-slate-200 animate-pulse" />
-          </div>
+      <div style={{ padding: 24, maxWidth: 800, margin: "0 auto", fontFamily: "ui-sans-serif, system-ui, -apple-system" }}>
+        <p>Caricamento…</p>
+      </div>
+    );
+  }
+
+  if (!userId) {
+    return (
+      <div style={{ minHeight: "100dvh", display: "grid", placeItems: "center", padding: 24 }}>
+        <div style={{ width: 420, maxWidth: "100%" }}>
+          <h1 style={{ fontSize: 24, fontWeight: 800, marginBottom: 12, textAlign: "center" }}>Accedi per gestire il magazzino</h1>
+          <Auth
+            supabaseClient={supabase}
+            appearance={{ theme: ThemeSupa }}
+            providers={["github", "google"]}
+            redirectTo={typeof window !== "undefined" ? window.location.origin : undefined}
+            magicLink
+          />
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100 p-6 text-slate-800">
-      <div className="max-w-7xl mx-auto grid gap-6">
-        {/* Header */}
-        <header className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <img src="/logo-olio-nece.svg" alt="Olio Nece" className="h-9 w-auto select-none" />
-            <div className="h-6 w-px bg-slate-300" />
-            <h1 className="text-3xl font-semibold tracking-tight">Magazzino Olio — Dashboard</h1>
-          </div>
-          <div className="flex gap-2">
-            <button onClick={refreshData} className="rounded-xl px-4 py-2 ring-1 ring-slate-300 bg-white hover:bg-slate-50 transition">Aggiorna</button>
-            <button
-              onClick={() => filteredStock.length ? downloadCSV('giacenze', filteredStock) : null}
-              className="rounded-xl px-4 py-2 ring-1 ring-slate-300 bg-white hover:bg-slate-50 transition disabled:opacity-50"
-              disabled={!filteredStock.length}
-              title="Esporta Giacenze CSV"
+    <div style={{ padding: 24, maxWidth: 1200, margin: "0 auto", fontFamily: "ui-sans-serif, system-ui, -apple-system" }}>
+      <header style={{ display: "flex", gap: 12, alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+        <h1 style={{ fontSize: 28, fontWeight: 800 }}>Gestione Magazzino Olio</h1>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button onClick={addYear} style={btn}>+ Anno</button>
+          <button onClick={addWarehouse} style={btn}>+ Magazzino</button>
+          <button onClick={exportCSV} style={btn}>Esporta CSV</button>
+          <label style={{ ...btn, cursor: "pointer" }}>
+            Importa CSV
+            <input type="file" accept=".csv" onChange={importCSV} style={{ display: "none" }} />
+          </label>
+          <button onClick={() => supabase.auth.signOut()} style={btn}>Esci</button>
+        </div>
+      </header>
+
+      <section style={card}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <div>
+            <label style={label}>Filtro anno</label>
+            <select
+              value={String(filterYear)}
+              onChange={(e) => setFilterYear(e.target.value === "all" ? "all" : Number(e.target.value))}
+              style={input}
             >
-              Esporta CSV
-            </button>
+              <option value="all">Tutti</option>
+              {years.sort((a, b) => b - a).map((y) => (
+                <option key={y} value={y}>{y}</option>
+              ))}
+            </select>
           </div>
-        </header>
+          <div>
+            <label style={label}>Cerca</label>
+            <input placeholder="2025, A, 500ml…" value={search} onChange={(e) => setSearch(e.target.value)} style={input} />
+          </div>
+        </div>
+      </section>
 
-        {/* KPIs */}
-        <section className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <div className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-4">
-            <div className="text-xs uppercase text-slate-500 mb-1">Pezzi totali</div>
-            <div className="text-2xl font-semibold">{kpi.pezzi}</div>
-          </div>
-          <div className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-4">
-            <div className="text-xs uppercase text-slate-500 mb-1">Litri totali</div>
-            <div className="text-2xl font-semibold">{kpi.litri.toFixed(2)}</div>
-          </div>
-          <div className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-4">
-            <div className="text-xs uppercase text-slate-500 mb-1">Magazzini</div>
-            <div className="text-2xl font-semibold">{warehouses.length}</div>
-          </div>
-          <div className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-4">
-            <div className="text-xs uppercase text-slate-500 mb-1">Ultimo movimento</div>
-            <div className="text-lg font-medium">{kpi.last ? new Date(kpi.last).toLocaleString() : '-'}</div>
-          </div>
-        </section>
-
-        {/* Filters */}
-        <section className="rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm p-4">
-          <div className="grid md:grid-cols-5 gap-3">
-            <div>
-              <label className="text-xs uppercase text-slate-500">Magazzino</label>
-              <select value={fWarehouse} onChange={e=>setFWarehouse(e.target.value)} className="mt-1 w-full rounded-xl border p-2">
-                {warehouseOptions.map(w => <option key={w} value={w}>{w}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="text-xs uppercase text-slate-500">Anno</label>
-              <select value={fYear} onChange={e=>setFYear(e.target.value)} className="mt-1 w-full rounded-xl border p-2">
-                {years.map(y => <option key={y} value={y}>{y}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="text-xs uppercase text-slate-500">Lotto</label>
-              <select value={fLot} onChange={e=>setFLot(e.target.value)} className="mt-1 w-full rounded-xl border p-2">
-                {lots.map(l => <option key={l} value={l}>{l}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="text-xs uppercase text-slate-500">Formato</label>
-              <select value={fFormat} onChange={e=>setFFormat(e.target.value)} className="mt-1 w-full rounded-xl border p-2">
-                {formats.map(f => <option key={f} value={f}>{f}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="text-xs uppercase text-slate-500">Cerca note/operatore</label>
-              <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Es. cliente X" className="mt-1 w-full rounded-xl border p-2" />
-            </div>
-          </div>
-        </section>
-
-        {error && <div className="rounded-xl bg-red-100 text-red-800 p-3">{error}</div>}
-        {success && <div className="rounded-xl bg-emerald-100 text-emerald-800 p-3">{success}</div>}
-
-        {/* Form + Stock */}
-        <section className="grid md:grid-cols-2 gap-6">
-          {/* Form */}
-          <div className="rounded-2xl shadow-sm ring-1 ring-slate-200 p-5 bg-white">
-            <h2 className="text-lg font-medium mb-4">Registra movimento</h2>
-            <div className="grid grid-cols-2 gap-3">
-              <div><label className="text-sm">Data</label>
-                <input type="date" value={form.date} onChange={e => setForm({ ...form, date: e.target.value })} className="mt-1 w-full rounded-xl border p-2"/></div>
-              <div><label className="text-sm">Operatore</label>
-                <input type="text" value={form.operator} onChange={e => setForm({ ...form, operator: e.target.value })} placeholder="Nome cognome" className="mt-1 w-full rounded-xl border p-2"/></div>
-              <div><label className="text-sm">Magazzino</label>
-                <select className="mt-1 w-full rounded-xl border p-2" value={form.warehouse_id} onChange={e => setForm({ ...form, warehouse_id: e.target.value })}>
-                  {warehouses.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
-                </select></div>
-              <div><label className="text-sm">Tipo</label>
-                <select className="mt-1 w-full rounded-xl border p-2" value={form.type} onChange={e => setForm({ ...form, type: e.target.value as 'Ingresso'|'Uscita' })}>
-                  <option>Ingresso</option><option>Uscita</option>
-                </select></div>
-              <div><label className="text-sm">Anno</label>
-                <input type="number" value={form.year} onChange={e => setForm({ ...form, year: parseInt(e.target.value || '0') })} className="mt-1 w-full rounded-xl border p-2"/></div>
-              <div><label className="text-sm">Lotto</label>
-                <select className="mt-1 w-full rounded-xl border p-2" value={form.lot} onChange={e => setForm({ ...form, lot: e.target.value as 'A'|'B'|'C' })}>
-                  <option value="A">A</option><option value="B">B</option><option value="C">C</option>
-                </select></div>
-              <div><label className="text-sm">Formato</label>
-                <select className="mt-1 w-full rounded-xl border p-2" value={form.format} onChange={e => setForm({ ...form, format: e.target.value as any })}>
-                  <option value="500ml">500ml</option><option value="250ml">250ml</option><option value="5L">5L</option>
-                </select></div>
-              <div><label className="text-sm">Pezzi</label>
-                <input type="number" min={1} value={form.pieces} onChange={e => setForm({ ...form, pieces: parseInt(e.target.value || '0') })} className="mt-1 w-full rounded-xl border p-2"/></div>
-              <div className="col-span-2"><label className="text-sm">Note</label>
-                <input type="text" placeholder="Es. cliente X / causale" value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} className="mt-1 w-full rounded-xl border p-2"/></div>
-            </div>
-            <div className="flex items-center justify-between mt-4">
-              <div className="text-sm text-slate-600">Anteprima: <b>{litersPreview.toFixed(2)}</b> L</div>
-              <button onClick={submitMovement} disabled={submitting} className="rounded-2xl px-4 py-2 bg-black text-white disabled:opacity-50 hover:bg-slate-800 transition">
-                {submitting ? 'Salvataggio…' : 'Registra'}
-              </button>
-            </div>
-            {warehouses.length === 0 && (
-              <div className="mt-4 text-sm">
-                Nessun magazzino trovato. <button onClick={seedWarehouses} className="underline">Crea Roma e Neci</button>.
-              </div>
-            )}
-          </div>
-
-          {/* Stock table */}
-          <div className="rounded-2xl shadow-sm ring-1 ring-slate-200 p-5 bg-white">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-lg font-medium">Giacenze (filtrate)</h2>
-              <button
-                onClick={() => filteredStock.length ? downloadCSV('giacenze_filtrate', filteredStock) : null}
-                className="text-sm underline disabled:opacity-50"
-                disabled={!filteredStock.length}
-              >
-                Esporta CSV
-              </button>
-            </div>
-            <div className="overflow-auto max-h-[480px]">
-              <table className="min-w-full text-sm">
-                <thead className="sticky top-0 bg-white">
-                  <tr className="text-left border-b">
-                    <th className="py-2 pr-4">Magazzino</th>
-                    <th className="py-2 pr-4">Anno</th>
-                    <th className="py-2 pr-4">Lotto</th>
-                    <th className="py-2 pr-4">Formato</th>
-                    <th className="py-2 pr-4">Pezzi</th>
-                    <th className="py-2 pr-4">Litri</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredStock.map((r, i) => (
-                    <tr key={i} className="border-b hover:bg-slate-50">
-                      <td className="py-2 pr-4">{r.warehouse}</td>
-                      <td className="py-2 pr-4">{r.year}</td>
-                      <td className="py-2 pr-4">{r.lot}</td>
-                      <td className="py-2 pr-4">{r.format}</td>
-                      <td className={classNames('py-2 pr-4', r.pezzi < 0 && 'text-red-600 font-medium')}>{r.pezzi}</td>
-                      <td className={classNames('py-2 pr-4', r.litri < 0 && 'text-red-600 font-medium')}>{r.litri.toFixed(2)}</td>
-                    </tr>
-                  ))}
-                  {!filteredStock.length && (
-                    <tr><td colSpan={6} className="py-4 text-gray-500">Nessuna giacenza (inserisci un primo movimento)</td></tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </section>
-
-        {/* History */}
-        <section className="rounded-2xl shadow-sm ring-1 ring-slate-200 p-5 bg-white">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-lg font-medium">Ultimi movimenti (filtrati)</h2>
-            <button
-              onClick={() => filteredHistory.length ? downloadCSV('storico_filtrato', filteredHistory) : null}
-              className="text-sm underline disabled:opacity-50"
-              disabled={!filteredHistory.length}
-            >
-              Esporta CSV
-            </button>
-          </div>
-          <div className="overflow-auto max-h-[600px]">
-            <table className="min-w-full text-sm">
-              <thead className="sticky top-0 bg-white">
-                <tr className="text-left border-b">
-                  <th className="py-2 pr-4">Quando</th>
-                  <th className="py-2 pr-4">Data</th>
-                  <th className="py-2 pr-4">Magazzino</th>
-                  <th className="py-2 pr-4">Tipo</th>
-                  <th className="py-2 pr-4">Anno</th>
-                  <th className="py-2 pr-4">Lotto</th>
-                  <th className="py-2 pr-4">Formato</th>
-                  <th className="py-2 pr-4">Pezzi</th>
-                  <th className="py-2 pr-4">Litri</th>
-                  <th className="py-2 pr-4">Operatore</th>
-                  <th className="py-2 pr-4">Note</th>
+      <section style={{ ...card, overflowX: "auto" }}>
+        <table style={{ borderCollapse: "collapse", width: "100%" }}>
+          <thead>
+            <tr>
+              <th style={th}>Anno</th>
+              <th style={th}>Lotto</th>
+              <th style={th}>Formato</th>
+              {warehouses.map((w) => (
+                <th key={w.id} style={th}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                    <span>{w.name}</span>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button title="Rinomina" onClick={() => renameWarehouse(w.id)} style={miniBtn}>✏️</button>
+                      <button title="Rimuovi" onClick={() => deleteWarehouse(w.id)} style={miniBtn}>🗑️</button>
+                    </div>
+                  </div>
+                </th>
+              ))}
+              <th style={th}>Totale Riga</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, idx) => {
+              const rowTotal = warehouses.reduce((sum, w) => sum + (r.totals[w.id] || 0), 0);
+              return (
+                <tr key={idx}>
+                  <td style={td}>{r.year}</td>
+                  <td style={td}>{r.lot}</td>
+                  <td style={td}>{r.format}</td>
+                  {warehouses.map((w) => {
+                    const k: ItemKey = { year: r.year, lot: r.lot, format: r.format, warehouseId: w.id };
+                    const v = r.totals[w.id] || 0;
+                    return (
+                      <td key={w.id} style={{ ...td, whiteSpace: "nowrap" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <button onClick={() => adjust(k, -1)} style={miniBtn}>−</button>
+                          <input
+                            type="number"
+                            min={0}
+                            value={v}
+                            onChange={(e) => setQty(k, Number(e.target.value))}
+                            style={{ ...input, width: 90, padding: "6px 8px" }}
+                          />
+                          <button onClick={() => adjust(k, +1)} style={miniBtn}>+</button>
+                        </div>
+                      </td>
+                    );
+                  })}
+                  <td style={{ ...td, fontWeight: 600 }}>{rowTotal}</td>
                 </tr>
-              </thead>
-              <tbody>
-                {filteredHistory.length === 0 ? (
-                  <tr><td colSpan={11} className="py-4 text-gray-500">Nessun movimento ancora</td></tr>
-                ) : filteredHistory.map((h, i) => (
-                  <tr key={h.id ?? i} className="border-b hover:bg-slate-50">
-                    <td className="py-2 pr-4">{new Date(h.created_at).toLocaleString()}</td>
-                    <td className="py-2 pr-4">{h.date}</td>
-                    <td className="py-2 pr-4">{h.warehouse}</td>
-                    <td className="py-2 pr-4 capitalize">{h.type}</td>
-                    <td className="py-2 pr-4">{h.year}</td>
-                    <td className="py-2 pr-4">{h.lot}</td>
-                    <td className="py-2 pr-4">{h.format}</td>
-                    <td className="py-2 pr-4">{h.pieces}</td>
-                    <td className="py-2 pr-4">{(h.liters ?? 0).toFixed?.(2) ?? h.liters}</td>
-                    <td className="py-2 pr-4">{h.operator || '-'}</td>
-                    <td className="py-2 pr-4">{h.notes || '-'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
-      </div>
+              );
+            })}
+          </tbody>
+          <tfoot>
+            <tr>
+              <td style={tf} colSpan={3}>Totali per Magazzino</td>
+              {warehouses.map((w) => (
+                <td key={w.id} style={tf}>{grandTotals[w.id] || 0}</td>
+              ))}
+              <td style={{ ...tf, fontWeight: 800 }}>{Object.values(grandTotals).reduce((a, b) => a + b, 0)}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </section>
+
+      <p style={{ fontSize: 12, color: "#666", marginTop: 12 }}>
+        ✅ Dati salvati su Supabase. Tutti gli utenti autenticati condividono lo stesso inventario (possiamo aggiungere i ruoli/aziende in seguito). 
+      </p>
+
+      <section style={{ ...card, marginTop: 16 }}>
+        <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>Schema SQL da eseguire su Supabase (una volta)</h2>
+        <pre style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>
+{`
+-- Tabella inventario
+create table if not exists public.inventory (
+  year int not null,
+  lot text not null check (lot in ('A','B','C')),
+  format text not null check (format in ('500ml','250ml','5L')),
+  warehouse_id text not null,
+  qty int not null default 0,
+  inserted_at timestamp with time zone default now(),
+  updated_at timestamp with time zone default now(),
+  primary key (year, lot, format, warehouse_id)
+);
+
+-- Trigger aggiornamento updated_at
+create or replace function public.set_updated_at()
+returns trigger as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$ language plpgsql;
+
+create trigger inventory_set_updated_at
+before update on public.inventory
+for each row execute function public.set_updated_at();
+
+-- Abilita RLS
+alter table public.inventory enable row level security;
+
+-- Policy: tutti gli utenti autenticati possono leggere/scrivere (semplice, condiviso)
+create policy "read_inventory"
+  on public.inventory for select
+  to authenticated
+  using (true);
+
+create policy "write_inventory"
+  on public.inventory for insert
+  to authenticated
+  with check (true);
+
+create policy "update_inventory"
+  on public.inventory for update
+  to authenticated
+  using (true)
+  with check (true);
+
+create policy "delete_inventory"
+  on public.inventory for delete
+  to authenticated
+  using (true);
+`}
+        </pre>
+        <p style={{ fontSize: 12, color: "#666" }}>
+          In una seconda fase possiamo creare <strong>team/aziende</strong> e limitare l’accesso per team/ruolo.
+        </p>
+      </section>
     </div>
   );
 }
+
+// ---- Styles --------------------------------------------------
+
+const btn: React.CSSProperties = {
+  border: "1px solid #ddd",
+  background: "#fff",
+  borderRadius: 10,
+  padding: "8px 12px",
+  fontWeight: 600,
+  cursor: "pointer",
+};
+
+const miniBtn: React.CSSProperties = {
+  border: "1px solid #ddd",
+  background: "#fff",
+  borderRadius: 8,
+  padding: "4px 8px",
+  fontWeight: 700,
+  cursor: "pointer",
+};
+
+const input: React.CSSProperties = {
+  border: "1px solid #ccc",
+  borderRadius: 8,
+  padding: "8px 10px",
+};
+
+const label: React.CSSProperties = {
+  display: "block",
+  fontSize: 12,
+  color: "#666",
+  marginBottom: 4,
+};
+
+const card: React.CSSProperties = {
+  border: "1px solid #eee",
+  borderRadius: 12,
+  padding: 16,
+  background: "#fafafa",
+  marginBottom: 16,
+};
+
+const th: React.CSSProperties = {
+  textAlign: "left",
+  padding: 10,
+  fontSize: 12,
+  color: "#666",
+  borderBottom: "1px solid #eee",
+  position: "sticky" as const,
+  top: 0,
+  background: "#fafafa",
+  zIndex: 1,
+};
+
+const td: React.CSSProperties = {
+  padding: 10,
+  borderBottom: "1px solid #f0f0f0",
+};
+
+const tf: React.CSSProperties = {
+  padding: 10,
+  borderTop: "2px solid #ddd",
+  background: "#f9f9f9",
+};
