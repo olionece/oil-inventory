@@ -4,12 +4,6 @@ import { createClient } from "@supabase/supabase-js";
 import { Auth } from "@supabase/auth-ui-react";
 import { ThemeSupa } from "@supabase/auth-ui-shared";
 
-// ------------------------------------------------------------
-// OIL INVENTORY — Next.js App Router (src/app/page.tsx)
-// Versione multi-utente con Supabase Auth + persistenza su DB
-// ------------------------------------------------------------
-
-// ---- Tipi ---------------------------------------------------
 type Warehouse = { id: string; name: string };
 type Format = "500ml" | "250ml" | "5L";
 type Lot = "A" | "B" | "C";
@@ -21,22 +15,21 @@ interface ItemKey {
   warehouseId: string;
 }
 
-// ---- Supabase -----------------------------------------------
+type Role = "owner" | "editor" | "viewer";
+
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
 
-// ---- Costanti -----------------------------------------------
 const DEFAULT_WAREHOUSES: Warehouse[] = [
   { id: "roma", name: "Roma" },
   { id: "neci", name: "Neci" },
 ];
-
 const LOTS: Lot[] = ["A", "B", "C"];
 const FORMATS: Format[] = ["500ml", "250ml", "5L"];
+const STORAGE_TEAM = "oil-inventory-selected-team";
 
-// ---- Helper -------------------------------------------------
 function keyOf(k: ItemKey) {
   return `${k.year}_${k.lot}_${k.format}_${k.warehouseId}`;
 }
@@ -51,47 +44,87 @@ function csvEscape(v: string | number) {
   return /[",\n]/.test(s) ? '"' + s.replaceAll('"', '""') + '"' : s;
 }
 
-// ---- Pagina -------------------------------------------------
-export default function OilInventoryPage() {
+export default function Page() {
+  const [userId, setUserId] = useState<string | null>(null);
+  const [loadingAuth, setLoadingAuth] = useState(true);
+
+  const [teams, setTeams] = useState<Array<{ id: string; name: string; role: Role }>>([]);
+  const [teamId, setTeamId] = useState<string | null>(null);
+  const [loadingTeams, setLoadingTeams] = useState(true);
+
   const [warehouses, setWarehouses] = useState<Warehouse[]>(DEFAULT_WAREHOUSES);
   const [years, setYears] = useState<number[]>([new Date().getFullYear()]);
   const [quantities, setQuantities] = useState<Record<string, number>>({});
   const [filterYear, setFilterYear] = useState<number | "all">("all");
   const [search, setSearch] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [userId, setUserId] = useState<string | null>(null);
+  const [loadingInventory, setLoadingInventory] = useState(false);
 
-  // ---- Auth state -------------------------------------------
+  // ---------- AUTH ----------
   useEffect(() => {
-    let subscribed = true;
+    let mounted = true;
     (async () => {
       const { data } = await supabase.auth.getUser();
-      if (!subscribed) return;
+      if (!mounted) return;
       setUserId(data.user?.id ?? null);
-      setLoading(false);
+      setLoadingAuth(false);
     })();
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
       setUserId(session?.user?.id ?? null);
     });
     return () => {
-      subscribed = false;
+      mounted = false;
       sub.subscription.unsubscribe();
     };
   }, []);
 
-  // ---- Load dal DB quando loggato ---------------------------
+  // ---------- TEAMS: load my memberships ----------
   useEffect(() => {
     if (!userId) return;
+    setLoadingTeams(true);
     (async () => {
-      setLoading(true);
+      // prendo le membership con join al team
+      const { data, error } = await supabase
+        .from("team_members")
+        .select("role, team_id, teams ( id, name )")
+        .eq("user_id", userId);
+      if (error) {
+        console.error(error);
+        setTeams([]);
+        setLoadingTeams(false);
+        return;
+      }
+      const mapped =
+        (data || []).map((row: any) => ({
+          id: row.teams.id as string,
+          name: row.teams.name as string,
+          role: row.role as Role,
+        })) ?? [];
+      setTeams(mapped);
+
+      // ripristina selezione team da localStorage se valido
+      const saved = typeof window !== "undefined" ? localStorage.getItem(STORAGE_TEAM) : null;
+      const exists = mapped.find((t) => t.id === saved);
+      const pick = exists ? exists.id : mapped[0]?.id ?? null;
+      setTeamId(pick || null);
+      if (pick && typeof window !== "undefined") localStorage.setItem(STORAGE_TEAM, pick);
+
+      setLoadingTeams(false);
+    })();
+  }, [userId]);
+
+  // ---------- INVENTORY: load when team changes ----------
+  useEffect(() => {
+    if (!userId || !teamId) return;
+    (async () => {
+      setLoadingInventory(true);
       const { data, error } = await supabase
         .from("inventory")
         .select("year, lot, format, warehouse_id, qty")
+        .eq("team_id", teamId)
         .order("year", { ascending: false });
-
       if (error) {
         console.error(error);
-        setLoading(false);
+        setLoadingInventory(false);
         return;
       }
       const next: Record<string, number> = {};
@@ -103,63 +136,50 @@ export default function OilInventoryPage() {
       }
       setQuantities(next);
       if (nextYears.size > 0) setYears(Array.from(nextYears).sort((a, b) => b - a));
-      setLoading(false);
+      setLoadingInventory(false);
     })();
-  }, [userId]);
+  }, [userId, teamId]);
 
-  // ---- Tabelle / Totali -------------------------------------
   const rows = useMemo(() => {
-    const makeRows: Array<{
-      year: number;
-      lot: Lot;
-      format: Format;
-      totals: Record<string, number>;
-    }> = [];
-
+    const out: Array<{ year: number; lot: Lot; format: Format; totals: Record<string, number> }> = [];
     for (const year of years.slice().sort((a, b) => b - a)) {
       for (const lot of LOTS) {
         for (const format of FORMATS) {
           const totals: Record<string, number> = {};
           for (const w of warehouses) {
-            const q = quantities[keyOf({ year, lot, format, warehouseId: w.id })] || 0;
-            totals[w.id] = q;
+            totals[w.id] = quantities[keyOf({ year, lot, format, warehouseId: w.id })] || 0;
           }
-          makeRows.push({ year, lot, format, totals });
+          out.push({ year, lot, format, totals });
         }
       }
     }
-
-    let filtered = makeRows;
+    let filtered = out;
     if (filterYear !== "all") filtered = filtered.filter((r) => r.year === filterYear);
-
     if (search.trim()) {
       const s = search.trim().toLowerCase();
       filtered = filtered.filter(
-        (r) =>
-          String(r.year).includes(s) ||
-          r.lot.toLowerCase().includes(s) ||
-          r.format.toLowerCase().includes(s)
+        (r) => String(r.year).includes(s) || r.lot.toLowerCase().includes(s) || r.format.toLowerCase().includes(s)
       );
     }
-
     return filtered;
   }, [years, warehouses, quantities, filterYear, search]);
 
   const grandTotals = useMemo(() => {
-    const byWarehouse: Record<string, number> = {};
-    for (const w of warehouses) byWarehouse[w.id] = 0;
+    const byW: Record<string, number> = {};
+    for (const w of warehouses) byW[w.id] = 0;
     for (const k in quantities) {
-      const parsed = parseKey(k);
-      if (!parsed) continue;
-      if (filterYear !== "all" && parsed.year !== filterYear) continue;
-      byWarehouse[parsed.warehouseId] += quantities[k] || 0;
+      const p = parseKey(k);
+      if (!p) continue;
+      if (filterYear !== "all" && p.year !== filterYear) continue;
+      byW[p.warehouseId] += quantities[k] || 0;
     }
-    return byWarehouse;
+    return byW;
   }, [quantities, warehouses, filterYear]);
 
-  // ---- Persistenza ------------------------------------------
   async function persistQty(k: ItemKey, qty: number) {
+    if (!teamId) return;
     const { error } = await supabase.from("inventory").upsert({
+      team_id: teamId,
       year: k.year,
       lot: k.lot,
       format: k.format,
@@ -174,51 +194,62 @@ export default function OilInventoryPage() {
     setQuantities((prev) => ({ ...prev, [keyOf(k)]: q }));
     persistQty(k, q);
   }
-
-  function adjust(k: ItemKey, delta: number) {
+  function adjust(k: ItemKey, d: number) {
     const curr = quantities[keyOf(k)] || 0;
-    setQty(k, curr + delta);
+    setQty(k, curr + d);
   }
 
-  // ---- UI: gestione anni/magazzini --------------------------
-  function addYear() {
-    const y = prompt("Aggiungi anno (es. 2025)");
-    if (!y) return;
-    const n = Number(y);
-    if (!n || n < 2000 || n > 2100) return alert("Anno non valido");
-    setYears((prev) => Array.from(new Set([...prev, n])).sort((a, b) => b - a));
-  }
-
-  function addWarehouse() {
-    const name = prompt("Nome magazzino");
+  // ---- Team actions ----
+  async function createTeam() {
+    const name = prompt("Nome nuovo team");
     if (!name) return;
-    const id = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-");
-    if (!id) return alert("Nome non valido");
-    if (warehouses.find((w) => w.id === id)) return alert("Magazzino già presente");
-    setWarehouses((prev) => [...prev, { id, name: name.trim() }]);
+    // crea team (owner = auth.uid())
+    const { data: tData, error: tErr } = await supabase
+      .from("teams")
+      .insert({ name, owner_user_id: userId })
+      .select("id")
+      .single();
+    if (tErr) return alert("Errore creazione team: " + tErr.message);
+
+    const newTeamId = tData!.id as string;
+
+    // aggiungi membership per l'owner
+    const { error: mErr } = await supabase
+      .from("team_members")
+      .insert({ team_id: newTeamId, user_id: userId, role: "owner" });
+    if (mErr) return alert("Errore membership: " + mErr.message);
+
+    // ricarica lista teams
+    const { data, error } = await supabase
+      .from("team_members")
+      .select("role, team_id, teams ( id, name )")
+      .eq("user_id", userId);
+    if (!error) {
+      const mapped =
+        (data || []).map((row: any) => ({
+          id: row.teams.id as string,
+          name: row.teams.name as string,
+          role: row.role as Role,
+        })) ?? [];
+      setTeams(mapped);
+      setTeamId(newTeamId);
+      if (typeof window !== "undefined") localStorage.setItem(STORAGE_TEAM, newTeamId);
+    }
   }
 
-  function renameWarehouse(id: string) {
-    const w = warehouses.find((w) => w.id === id);
-    if (!w) return;
-    const name = prompt("Rinomina magazzino", w.name);
-    if (!name) return;
-    setWarehouses((prev) => prev.map((x) => (x.id === id ? { ...x, name } : x)));
+  function onSelectTeam(id: string) {
+    setTeamId(id);
+    if (typeof window !== "undefined") localStorage.setItem(STORAGE_TEAM, id);
   }
 
-  function deleteWarehouse(id: string) {
-    if (!confirm("Eliminare questo magazzino? I dati resteranno nel DB ma non saranno mostrati.")) return;
-    setWarehouses((prev) => prev.filter((w) => w.id !== id));
-  }
-
-  // ---- Import/Export ----------------------------------------
+  // ---- Import/Export ----
   function exportCSV() {
-    const headers = ["year", "lot", "format", "warehouse", "qty"];
+    const headers = ["team_id", "year", "lot", "format", "warehouse", "qty"];
     const lines = [headers.join(",")];
     for (const k in quantities) {
       const p = parseKey(k);
-      if (!p) continue;
-      lines.push([p.year, p.lot, p.format, p.warehouseId, quantities[k]].map(csvEscape).join(","));
+      if (!p || !teamId) continue;
+      lines.push([teamId, p.year, p.lot, p.format, p.warehouseId, quantities[k]].map(csvEscape).join(","));
     }
     const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
@@ -231,7 +262,7 @@ export default function OilInventoryPage() {
 
   function importCSV(ev: React.ChangeEvent<HTMLInputElement>) {
     const file = ev.target.files?.[0];
-    if (!file) return;
+    if (!file || !teamId) return;
     const reader = new FileReader();
     reader.onload = async () => {
       try {
@@ -239,12 +270,11 @@ export default function OilInventoryPage() {
         const lines = text.split(/\r?\n/).filter(Boolean);
         const [header, ...rows] = lines;
         const cols = header.split(",").map((s) => s.trim());
-        const colIdx = (name: string) => cols.findIndex((c) => c === name);
-        const iYear = colIdx("year");
-        const iLot = colIdx("lot");
-        const iFormat = colIdx("format");
-        const iWh = colIdx("warehouse");
-        const iQty = colIdx("qty");
+        const iYear = cols.indexOf("year");
+        const iLot = cols.indexOf("lot");
+        const iFormat = cols.indexOf("format");
+        const iWh = cols.indexOf("warehouse");
+        const iQty = cols.indexOf("qty");
         if ([iYear, iLot, iFormat, iWh, iQty].some((i) => i < 0))
           throw new Error("Colonne richieste: year, lot, format, warehouse, qty");
 
@@ -257,14 +287,13 @@ export default function OilInventoryPage() {
           const year = Number(cells[iYear]);
           const lot = cells[iLot] as Lot;
           const format = cells[iFormat] as Format;
-          const warehouseId = cells[iWh];
-          const qty = Number(cells[iQty]);
-          if (!year || !lot || !format || !warehouseId || isNaN(qty)) continue;
+          const warehouse_id = cells[iWh];
+          const qty = Math.max(0, Math.floor(Number(cells[iQty])));
+          if (!year || !lot || !format || !warehouse_id || isNaN(qty)) continue;
 
-          const qv = Math.max(0, Math.floor(qty));
-          next[keyOf({ year, lot, format, warehouseId })] = qv;
+          next[keyOf({ year, lot, format, warehouseId: warehouse_id })] = qty;
           nextYears.add(year);
-          ups.push({ year, lot, format, warehouse_id: warehouseId, qty: qv });
+          ups.push({ team_id: teamId, year, lot, format, warehouse_id, qty });
         }
 
         setQuantities(next);
@@ -273,7 +302,7 @@ export default function OilInventoryPage() {
         if (ups.length) {
           const { error } = await supabase
             .from("inventory")
-            .upsert(ups, { onConflict: "year,lot,format,warehouse_id" });
+            .upsert(ups, { onConflict: "team_id,year,lot,format,warehouse_id" });
           if (error) throw error;
         }
         alert("Importazione completata");
@@ -286,14 +315,8 @@ export default function OilInventoryPage() {
     reader.readAsText(file);
   }
 
-  // ---- Rendering --------------------------------------------
-  if (loading) {
-    return (
-      <div style={{ padding: 24, maxWidth: 800, margin: "0 auto", fontFamily: "ui-sans-serif, system-ui, -apple-system" }}>
-        <p>Caricamento…</p>
-      </div>
-    );
-  }
+  // ---------- RENDER ----------
+  if (loadingAuth) return <div style={{ padding: 24 }}>Caricamento…</div>;
 
   if (!userId) {
     return (
@@ -302,195 +325,170 @@ export default function OilInventoryPage() {
           <h1 style={{ fontSize: 24, fontWeight: 800, marginBottom: 12, textAlign: "center" }}>
             Accedi per gestire il magazzino
           </h1>
-          <Auth
-            supabaseClient={supabase}
-            appearance={{ theme: ThemeSupa }}
-            providers={["github", "google"]}
-            redirectTo={typeof window !== "undefined" ? window.location.origin : undefined}
-            magicLink
-          />
+          <Auth supabaseClient={supabase} appearance={{ theme: ThemeSupa }} providers={["github","google"]} magicLink />
         </div>
       </div>
     );
   }
 
+  if (loadingTeams) return <div style={{ padding: 24 }}>Carico i tuoi team…</div>;
+
   return (
     <div style={{ padding: 24, maxWidth: 1200, margin: "0 auto", fontFamily: "ui-sans-serif, system-ui, -apple-system" }}>
       <header style={{ display: "flex", gap: 12, alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
-        <h1 style={{ fontSize: 28, fontWeight: 800 }}>Gestione Magazzino Olio</h1>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <h1 style={{ fontSize: 28, fontWeight: 800 }}>Gestione Magazzino Olio</h1>
+          {/* Selettore team */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <label style={{ fontSize: 12, color: "#666" }}>Team</label>
+            <select
+              value={teamId ?? ""}
+              onChange={(e) => onSelectTeam(e.target.value)}
+              style={{ border: "1px solid #ccc", borderRadius: 8, padding: "8px 10px" }}
+            >
+              {teams.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name} {t.role === "owner" ? "👑" : t.role === "editor" ? "✍️" : "👀"}
+                </option>
+              ))}
+            </select>
+            <button onClick={createTeam} style={btn}>+ Nuovo team</button>
+          </div>
+        </div>
+
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <button onClick={addYear} style={btn}>+ Anno</button>
-          <button onClick={addWarehouse} style={btn}>+ Magazzino</button>
-          <button onClick={exportCSV} style={btn}>Esporta CSV</button>
-          <label style={{ ...btn, cursor: "pointer" }}>
-            Importa CSV
-            <input type="file" accept=".csv" onChange={importCSV} style={{ display: "none" }} />
-          </label>
           <button onClick={() => supabase.auth.signOut()} style={btn}>Esci</button>
         </div>
       </header>
 
-      <section style={card}>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <div>
-            <label style={label}>Filtro anno</label>
-            <select
-              value={String(filterYear)}
-              onChange={(e) => setFilterYear(e.target.value === "all" ? "all" : Number(e.target.value))}
-              style={input}
-            >
-              <option value="all">Tutti</option>
-              {years.slice().sort((a, b) => b - a).map((y) => (
-                <option key={y} value={y}>{y}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label style={label}>Cerca</label>
-            <input
-              placeholder="2025, A, 500ml…"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              style={input}
-            />
-          </div>
+      {!teamId ? (
+        <div style={card}>
+          <p>Nessun team selezionato. Crea un <strong>Nuovo team</strong> per iniziare.</p>
         </div>
-      </section>
+      ) : (
+        <>
+          <section style={card}>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <div>
+                <label style={label}>Filtro anno</label>
+                <select
+                  value={String(filterYear)}
+                  onChange={(e) => setFilterYear(e.target.value === "all" ? "all" : Number(e.target.value))}
+                  style={input}
+                >
+                  <option value="all">Tutti</option>
+                  {years.slice().sort((a, b) => b - a).map((y) => (
+                    <option key={y} value={y}>{y}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label style={label}>Cerca</label>
+                <input placeholder="2025, A, 500ml…" value={search} onChange={(e) => setSearch(e.target.value)} style={input} />
+              </div>
+              <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+                <button onClick={() => {
+                  const y = prompt("Aggiungi anno (es. 2025)");
+                  if (!y) return;
+                  const n = Number(y);
+                  if (!n || n < 2000 || n > 2100) return alert("Anno non valido");
+                  setYears((prev) => Array.from(new Set([...prev, n])).sort((a, b) => b - a));
+                }} style={btn}>+ Anno</button>
+                <button onClick={() => {
+                  const name = prompt("Nome magazzino");
+                  if (!name) return;
+                  const id = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-");
+                  if (!id) return alert("Nome non valido");
+                  if (warehouses.find((w) => w.id === id)) return alert("Magazzino già presente");
+                  setWarehouses((prev) => [...prev, { id, name: name.trim() }]);
+                }} style={btn}>+ Magazzino</button>
+                <button onClick={exportCSV} style={btn}>Esporta CSV</button>
+                <label style={{ ...btn, cursor: "pointer" }}>
+                  Importa CSV
+                  <input type="file" accept=".csv" onChange={importCSV} style={{ display: "none" }} />
+                </label>
+              </div>
+            </div>
+          </section>
 
-      <section style={{ ...card, overflowX: "auto" }}>
-        <table style={{ borderCollapse: "collapse", width: "100%" }}>
-          <thead>
-            <tr>
-              <th style={th}>Anno</th>
-              <th style={th}>Lotto</th>
-              <th style={th}>Formato</th>
-              {warehouses.map((w) => (
-                <th key={w.id} style={th}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-                    <span>{w.name}</span>
-                    <div style={{ display: "flex", gap: 6 }}>
-                      <button title="Rinomina" onClick={() => renameWarehouse(w.id)} style={miniBtn}>✏️</button>
-                      <button title="Rimuovi" onClick={() => deleteWarehouse(w.id)} style={miniBtn}>🗑️</button>
-                    </div>
-                  </div>
-                </th>
-              ))}
-              <th style={th}>Totale Riga</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r, idx) => {
-              const rowTotal = warehouses.reduce((sum, w) => sum + (r.totals[w.id] || 0), 0);
-              return (
-                <tr key={idx}>
-                  <td style={td}>{r.year}</td>
-                  <td style={td}>{r.lot}</td>
-                  <td style={td}>{r.format}</td>
-                  {warehouses.map((w) => {
-                    const k: ItemKey = { year: r.year, lot: r.lot, format: r.format, warehouseId: w.id };
-                    const v = r.totals[w.id] || 0;
+          <section style={{ ...card, overflowX: "auto" }}>
+            {loadingInventory ? (
+              <p>Carico inventario…</p>
+            ) : (
+              <table style={{ borderCollapse: "collapse", width: "100%" }}>
+                <thead>
+                  <tr>
+                    <th style={th}>Anno</th>
+                    <th style={th}>Lotto</th>
+                    <th style={th}>Formato</th>
+                    {warehouses.map((w) => (
+                      <th key={w.id} style={th}>{w.name}</th>
+                    ))}
+                    <th style={th}>Totale Riga</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r, idx) => {
+                    const rowTotal = warehouses.reduce((sum, w) => sum + (r.totals[w.id] || 0), 0);
                     return (
-                      <td key={w.id} style={{ ...td, whiteSpace: "nowrap" }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <button onClick={() => adjust(k, -1)} style={miniBtn}>−</button>
-                          <input
-                            type="number"
-                            min={0}
-                            value={v}
-                            onChange={(e) => setQty(k, Number(e.target.value))}
-                            style={{ ...input, width: 90, padding: "6px 8px" }}
-                          />
-                          <button onClick={() => adjust(k, +1)} style={miniBtn}>+</button>
-                        </div>
-                      </td>
+                      <tr key={idx}>
+                        <td style={td}>{r.year}</td>
+                        <td style={td}>{r.lot}</td>
+                        <td style={td}>{r.format}</td>
+                        {warehouses.map((w) => {
+                          const k: ItemKey = { year: r.year, lot: r.lot, format: r.format, warehouseId: w.id };
+                          const v = r.totals[w.id] || 0;
+                          return (
+                            <td key={w.id} style={{ ...td, whiteSpace: "nowrap" }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                                <button onClick={() => adjust(k, -1)} style={miniBtn}>−</button>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  value={v}
+                                  onChange={(e) => setQty(k, Number(e.target.value))}
+                                  style={{ ...input, width: 90, padding: "6px 8px" }}
+                                />
+                                <button onClick={() => adjust(k, +1)} style={miniBtn}>+</button>
+                              </div>
+                            </td>
+                          );
+                        })}
+                        <td style={{ ...td, fontWeight: 600 }}>{rowTotal}</td>
+                      </tr>
                     );
                   })}
-                  <td style={{ ...td, fontWeight: 600 }}>{rowTotal}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-          <tfoot>
-            <tr>
-              <td style={tf} colSpan={3}>Totali per Magazzino</td>
-              {warehouses.map((w) => (
-                <td key={w.id} style={tf}>{grandTotals[w.id] || 0}</td>
-              ))}
-              <td style={{ ...tf, fontWeight: 800 }}>
-                {Object.values(grandTotals).reduce((a, b) => a + b, 0)}
-              </td>
-            </tr>
-          </tfoot>
-        </table>
-      </section>
+                </tbody>
+                <tfoot>
+                  <tr>
+                    <td style={tf} colSpan={3}>Totali per Magazzino</td>
+                    {warehouses.map((w) => (
+                      <td key={w.id} style={tf}>{grandTotals[w.id] || 0}</td>
+                    ))}
+                    <td style={{ ...tf, fontWeight: 800 }}>
+                      {Object.values(grandTotals).reduce((a, b) => a + b, 0)}
+                    </td>
+                  </tr>
+                </tfoot>
+              </table>
+            )}
+          </section>
 
-      <p style={{ fontSize: 12, color: "#666", marginTop: 12 }}>
-        ✅ Dati salvati su Supabase. Tutti gli utenti autenticati condividono lo stesso inventario
-        (in seguito possiamo aggiungere team/ruoli per separarli).
-      </p>
+          <p style={{ fontSize: 12, color: "#666", marginTop: 12 }}>
+            🔒 Dati limitati al team selezionato. Ruoli: <b>owner</b> (gestione totale), <b>editor</b> (scrive), <b>viewer</b> (solo lettura).
+          </p>
+        </>
+      )}
     </div>
   );
 }
 
-// ---- Stili inline semplici ----------------------------------
-const btn: React.CSSProperties = {
-  border: "1px solid #ddd",
-  background: "#fff",
-  borderRadius: 10,
-  padding: "8px 12px",
-  fontWeight: 600,
-  cursor: "pointer",
-};
-
-const miniBtn: React.CSSProperties = {
-  border: "1px solid #ddd",
-  background: "#fff",
-  borderRadius: 8,
-  padding: "4px 8px",
-  fontWeight: 700,
-  cursor: "pointer",
-};
-
-const input: React.CSSProperties = {
-  border: "1px solid #ccc",
-  borderRadius: 8,
-  padding: "8px 10px",
-};
-
-const label: React.CSSProperties = {
-  display: "block",
-  fontSize: 12,
-  color: "#666",
-  marginBottom: 4,
-};
-
-const card: React.CSSProperties = {
-  border: "1px solid #eee",
-  borderRadius: 12,
-  padding: 16,
-  background: "#fafafa",
-  marginBottom: 16,
-};
-
-const th: React.CSSProperties = {
-  textAlign: "left",
-  padding: 10,
-  fontSize: 12,
-  color: "#666",
-  borderBottom: "1px solid #eee",
-  position: "sticky" as const,
-  top: 0,
-  background: "#fafafa",
-  zIndex: 1,
-};
-
-const td: React.CSSProperties = {
-  padding: 10,
-  borderBottom: "1px solid #f0f0f0",
-};
-
-const tf: React.CSSProperties = {
-  padding: 10,
-  borderTop: "2px solid #ddd",
-  background: "#f9f9f9",
-};
+// ---- Stili
+const btn: React.CSSProperties = { border: "1px solid #ddd", background: "#fff", borderRadius: 10, padding: "8px 12px", fontWeight: 600, cursor: "pointer" };
+const miniBtn: React.CSSProperties = { border: "1px solid #ddd", background: "#fff", borderRadius: 8, padding: "4px 8px", fontWeight: 700, cursor: "pointer" };
+const input: React.CSSProperties = { border: "1px solid #ccc", borderRadius: 8, padding: "8px 10px" };
+const label: React.CSSProperties = { display: "block", fontSize: 12, color: "#666", marginBottom: 4 };
+const card: React.CSSProperties = { border: "1px solid #eee", borderRadius: 12, padding: 16, background: "#fafafa", marginBottom: 16 };
+const th: React.CSSProperties = { textAlign: "left", padding: 10, fontSize: 12, color: "#666", borderBottom: "1px solid #eee", position: "sticky" as const, top: 0, background: "#fafafa", zIndex: 1 };
+const td: React.CSSProperties = { padding: 10, borderBottom: "1px solid #f0f0f0" };
+const tf: React.CSSProperties = { padding: 10, borderTop: "2px solid #ddd", background: "#f9f9f9" };
