@@ -113,20 +113,32 @@ export default function Page() {
   }, [userId]);
 
   // ---------- INVENTORY: load when team changes ----------
-  useEffect(() => {
-    if (!userId || !teamId) return;
-    (async () => {
-      setLoadingInventory(true);
+useEffect(() => {
+  if (!userId || !teamId) return;
+  (async () => {
+    setLoadingInventory(true);
+    try {
       const { data, error } = await supabase
         .from("inventory")
         .select("year, lot, format, warehouse_id, qty")
         .eq("team_id", teamId)
-        .order("year", { ascending: false });
+        .order("year", { ascending: false })
+        .throwOnError(); // forza l’errore “vero”
+
+      console.log("[INV FETCH]", {
+        userId,
+        teamId,
+        rows: data?.length ?? 0,
+        error: error ? (error.message || error) : null,
+      });
+
       if (error) {
-        console.error(error);
+        // vediamo OGNI dettaglio in console
+        console.error("Inventory error:", error?.message || error, error);
         setLoadingInventory(false);
         return;
       }
+
       const next: Record<string, number> = {};
       const nextYears = new Set<number>();
       for (const row of data || []) {
@@ -136,68 +148,14 @@ export default function Page() {
       }
       setQuantities(next);
       if (nextYears.size > 0) setYears(Array.from(nextYears).sort((a, b) => b - a));
+    } catch (e: any) {
+      // catch aggiuntivo in caso di throwOnError
+      console.error("Inventory exception:", e?.message || e, e);
+    } finally {
       setLoadingInventory(false);
-    })();
-  }, [userId, teamId]);
-
-  const rows = useMemo(() => {
-    const out: Array<{ year: number; lot: Lot; format: Format; totals: Record<string, number> }> = [];
-    for (const year of years.slice().sort((a, b) => b - a)) {
-      for (const lot of LOTS) {
-        for (const format of FORMATS) {
-          const totals: Record<string, number> = {};
-          for (const w of warehouses) {
-            totals[w.id] = quantities[keyOf({ year, lot, format, warehouseId: w.id })] || 0;
-          }
-          out.push({ year, lot, format, totals });
-        }
-      }
     }
-    let filtered = out;
-    if (filterYear !== "all") filtered = filtered.filter((r) => r.year === filterYear);
-    if (search.trim()) {
-      const s = search.trim().toLowerCase();
-      filtered = filtered.filter(
-        (r) => String(r.year).includes(s) || r.lot.toLowerCase().includes(s) || r.format.toLowerCase().includes(s)
-      );
-    }
-    return filtered;
-  }, [years, warehouses, quantities, filterYear, search]);
-
-  const grandTotals = useMemo(() => {
-    const byW: Record<string, number> = {};
-    for (const w of warehouses) byW[w.id] = 0;
-    for (const k in quantities) {
-      const p = parseKey(k);
-      if (!p) continue;
-      if (filterYear !== "all" && p.year !== filterYear) continue;
-      byW[p.warehouseId] += quantities[k] || 0;
-    }
-    return byW;
-  }, [quantities, warehouses, filterYear]);
-
-  async function persistQty(k: ItemKey, qty: number) {
-    if (!teamId) return;
-    const { error } = await supabase.from("inventory").upsert({
-      team_id: teamId,
-      year: k.year,
-      lot: k.lot,
-      format: k.format,
-      warehouse_id: k.warehouseId,
-      qty,
-    });
-    if (error) console.error("Errore upsert:", error);
-  }
-
-  function setQty(k: ItemKey, next: number) {
-    const q = Math.max(0, Math.floor(next));
-    setQuantities((prev) => ({ ...prev, [keyOf(k)]: q }));
-    persistQty(k, q);
-  }
-  function adjust(k: ItemKey, d: number) {
-    const curr = quantities[keyOf(k)] || 0;
-    setQty(k, curr + d);
-  }
+  })();
+}, [userId, teamId]);
 
   // ---- Team actions ----
   async function createTeam() {
